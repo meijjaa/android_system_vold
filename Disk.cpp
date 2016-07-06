@@ -43,7 +43,11 @@ using android::base::StringPrintf;
 namespace android {
 namespace vold {
 
+#ifdef MINIVOLD
+static const char* kSgdiskPath = "/sbin/sgdisk";
+#else
 static const char* kSgdiskPath = "/system/bin/sgdisk";
+#endif
 static const char* kSgdiskToken = " \t\n";
 
 static const char* kSysfsMmcMaxMinors = "/sys/module/mmcblk/parameters/perdev_minors";
@@ -79,8 +83,8 @@ enum class Table {
 Disk::Disk(const std::string& eventPath, dev_t device,
         const std::string& nickname, int flags) :
         mDevice(device), mSize(-1), mNickname(nickname), mFlags(flags), mCreated(
-                false), mJustPartitioned(false) {
-    mId = StringPrintf("disk:%u,%u", major(device), minor(device));
+                false), mJustPartitioned(false), mSkipChange(false) {
+    mId = StringPrintf("disk:%u_%u", major(device), minor(device));
     mEventPath = eventPath;
     mSysPath = StringPrintf("/sys/%s", eventPath.c_str());
     mDevPath = StringPrintf("/dev/block/vold/%s", mId.c_str());
@@ -131,8 +135,10 @@ status_t Disk::destroy() {
     return OK;
 }
 
-void Disk::createPublicVolume(dev_t device) {
-    auto vol = std::shared_ptr<VolumeBase>(new PublicVolume(device));
+void Disk::createPublicVolume(dev_t device,
+                const std::string& fstype /* = "" */,
+                const std::string& mntopts /* = "" */) {
+    auto vol = std::shared_ptr<VolumeBase>(new PublicVolume(device, mNickname, fstype, mntopts));
     if (mJustPartitioned) {
         LOG(DEBUG) << "Device just partitioned; silently formatting";
         vol->setSilent(true);
@@ -186,6 +192,11 @@ void Disk::destroyAllVolumes() {
 }
 
 status_t Disk::readMetadata() {
+
+    if (mSkipChange) {
+        return OK;
+    }
+
     mSize = -1;
     mLabel.clear();
 
@@ -248,6 +259,12 @@ status_t Disk::readPartitions() {
         return -ENOTSUP;
     }
 
+    if (mSkipChange) {
+        mSkipChange = false;
+        LOG(INFO) << "Skip first change";
+        return OK;
+    }
+
     destroyAllVolumes();
 
     // Parse partition table
@@ -295,9 +312,11 @@ status_t Disk::readPartitions() {
 
                 switch (strtol(type, nullptr, 16)) {
                 case 0x06: // FAT16
+                case 0x07: // NTFS/exFAT
                 case 0x0b: // W95 FAT32 (LBA)
                 case 0x0c: // W95 FAT32 (LBA)
                 case 0x0e: // W95 FAT16 (LBA)
+                case 0x83: // Linux EXT4/F2FS/...
                     createPublicVolume(partDevice);
                     break;
                 }
@@ -405,8 +424,45 @@ status_t Disk::partitionMixed(int8_t ratio) {
     destroyAllVolumes();
     mJustPartitioned = true;
 
-    // First nuke any existing partition table
+    // Determine if we're coming from MBR
     std::vector<std::string> cmd;
+    cmd.push_back(kSgdiskPath);
+    cmd.push_back("--android-dump");
+    cmd.push_back(mDevPath);
+
+    std::vector<std::string> output;
+    res = ForkExecvp(cmd, output);
+    if (res != OK) {
+        LOG(WARNING) << "sgdisk failed to scan " << mDevPath;
+        mJustPartitioned = false;
+        return res;
+    }
+
+    Table table = Table::kUnknown;
+    for (auto line : output) {
+        char* cline = (char*) line.c_str();
+        char* token = strtok(cline, kSgdiskToken);
+        if (token == nullptr) continue;
+
+        if (!strcmp(token, "DISK")) {
+            const char* type = strtok(nullptr, kSgdiskToken);
+            if (!strcmp(type, "mbr")) {
+                table = Table::kMbr;
+                break;
+            } else if (!strcmp(type, "gpt")) {
+                table = Table::kGpt;
+                break;
+            }
+        }
+    }
+
+    if (table == Table::kMbr) {
+        LOG(INFO) << "skip first disk change event due to MBR -> GPT switch";
+        mSkipChange = true;
+    }
+
+    // First nuke any existing partition table
+    cmd.clear();
     cmd.push_back(kSgdiskPath);
     cmd.push_back("--zap-all");
     cmd.push_back(mDevPath);

@@ -2265,22 +2265,7 @@ int cryptfs_revert_ext_volume(const char* label) {
 
 int cryptfs_crypto_complete(void)
 {
-  int mdtp_activated = fs_mgr_is_mdtp_activated();
-  int crypto_state = do_crypto_complete("/data");
-
-  /* if MDTP is activated, it should be reflected in the crypto state */
-  if(mdtp_activated){
-    if (crypto_state != CRYPTO_COMPLETE_ENCRYPTED ){
-      /* MDTP is activated and crypto state is bad */
-      return CRYPTO_COMPLETE_ERROR_MDTP_ACTIVATED;
-    } else {
-      /* MDTP is activated and crypto state is ok */
-      return CRYPTO_COMPLETE_ENCRYPTED_MDTP_ACTIVATED;
-    }
-  }
-
-  /* mdtp is not activated, return the crypto state only */
-  return crypto_state;
+  return do_crypto_complete("/data");
 }
 
 int check_unmounted_and_get_ftr(struct crypt_mnt_ftr* crypt_ftr)
@@ -3223,7 +3208,7 @@ int cryptfs_enable_internal(char *howarg, int crypt_type, char *passwd,
     }
 
     property_get("ro.crypto.state", encrypted_state, "");
-    if (how != CRYPTO_ENABLE_WIPE && !strcmp(encrypted_state, "encrypted") && !previously_encrypted_upto) {
+    if (!strcmp(encrypted_state, "encrypted") && !previously_encrypted_upto) {
         SLOGE("Device is already running encrypted, aborting");
         goto error_unencrypted;
     }
